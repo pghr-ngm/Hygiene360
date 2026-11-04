@@ -377,13 +377,26 @@ router.get('/buildings', async (req, res) => {
   res.json({ success: true, buildings });
 });
 
+// Location codes are unique within their parent, so a clashing code gets -2, -3 ... appended
+async function freeLocationCode(table, parentCol, parentId, code) {
+  const base = String(code).toUpperCase().trim();
+  let candidate = base;
+  for (let n = 2; await db.get(`SELECT id FROM ${table} WHERE ${parentCol} = ? AND code = ?`, [parentId, candidate]); n++) {
+    candidate = `${base}-${n}`;
+  }
+  return candidate;
+}
+
 router.post('/buildings', async (req, res) => {
   const { plantId, code, name } = req.body;
   if (!plantId || !code || !name) {
     return res.status(400).json({ success: false, error: 'plantId, code, and name are required' });
   }
   try {
-    const r = await db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, code.toUpperCase().trim(), name.trim()]);
+    const existing = await db.get('SELECT id FROM buildings WHERE plant_id = ? AND LOWER(name) = LOWER(?)', [Number(plantId), name.trim()]);
+    if (existing) return res.json({ success: true, buildingId: existing.id, message: 'Building already exists - selected it' });
+    const finalCode = await freeLocationCode('buildings', 'plant_id', Number(plantId), code);
+    const r = await db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, finalCode, name.trim()]);
     res.json({ success: true, buildingId: r.lastInsertRowid, message: 'Building created successfully' });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
@@ -408,7 +421,10 @@ router.post('/blocks', async (req, res) => {
     return res.status(400).json({ success: false, error: 'buildingId, code, and name are required' });
   }
   try {
-    const r = await db.run('INSERT INTO blocks (building_id, code, name) VALUES (?, ?, ?)', [Number(buildingId), code.toUpperCase().trim(), name.trim()]);
+    const existing = await db.get('SELECT id FROM blocks WHERE building_id = ? AND LOWER(name) = LOWER(?)', [Number(buildingId), name.trim()]);
+    if (existing) return res.json({ success: true, blockId: existing.id, message: 'Block already exists - selected it' });
+    const finalCode = await freeLocationCode('blocks', 'building_id', Number(buildingId), code);
+    const r = await db.run('INSERT INTO blocks (building_id, code, name) VALUES (?, ?, ?)', [Number(buildingId), finalCode, name.trim()]);
     await auditLogFromReq(req, 'BLOCK_CREATED', 'BLOCK', code, { building_id: buildingId, name });
     res.json({ success: true, blockId: r.lastInsertRowid, message: 'Block created successfully' });
   } catch (err) {
@@ -448,6 +464,7 @@ router.post('/floors', async (req, res) => {
     if (block && await db.get('SELECT id FROM floors WHERE building_id = ? AND code = ?', [Number(buildingId), finalCode])) {
       finalCode = `${block.code}-${finalCode}`;
     }
+    finalCode = await freeLocationCode('floors', 'building_id', Number(buildingId), finalCode);
     const r = await db.run('INSERT INTO floors (building_id, block_id, code, name, floor_number) VALUES (?, ?, ?, ?, ?)',
       [buildingId, block ? Number(blockId) : null, finalCode, name.trim(), floorNumber]);
     res.json({ success: true, floorId: r.lastInsertRowid, message: 'Floor created successfully' });
@@ -475,9 +492,12 @@ router.post('/areas', async (req, res) => {
     return res.status(400).json({ success: false, error: 'floorId, code, and name are required' });
   }
   try {
+    const existing = await db.get('SELECT id FROM areas WHERE floor_id = ? AND LOWER(name) = LOWER(?)', [Number(floorId), name.trim()]);
+    if (existing) return res.json({ success: true, areaId: existing.id, message: 'Area already exists - selected it' });
+    const finalCode = await freeLocationCode('areas', 'floor_id', Number(floorId), code);
     const r = await db.run(
       'INSERT INTO areas (floor_id, code, name, assigned_user_id) VALUES (?, ?, ?, ?)',
-      [floorId, code.toUpperCase().trim(), name.trim(), assignedUserId ? Number(assignedUserId) : null]
+      [floorId, finalCode, name.trim(), assignedUserId ? Number(assignedUserId) : null]
     );
     res.json({ success: true, areaId: r.lastInsertRowid, message: 'Area created successfully' });
   } catch (err) {
@@ -649,7 +669,13 @@ router.post('/qr-master/create-facility', async (req, res) => {
       message: `Toilet ${finalUid} created. Print its QR placard from the list.`
     });
   } catch (err) {
-    res.status(400).json({ success: false, error: 'Failed to create facility: ' + err.message });
+    const duplicate = /UNIQUE|duplicate key/i.test(err.message);
+    res.status(400).json({
+      success: false,
+      error: duplicate
+        ? `Toilet code ${String(code).toUpperCase().trim()} already exists in this plant. Use a different toilet code.`
+        : 'Failed to create facility: ' + err.message
+    });
   }
 });
 
